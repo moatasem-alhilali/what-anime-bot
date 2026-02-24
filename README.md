@@ -8,14 +8,16 @@ Telegram bot that receives an anime screenshot as a photo, sends it to Trace.moe
 - Single Vercel Serverless Function (`/api/telegram.js`)
 - Accepts Telegram photo messages only
 - Downloads image from Telegram servers in memory
-- Sends multipart request to Trace.moe (`image` field)
+- Sends multipart request to Trace.moe (`image` field) with `anilistInfo` + `cutBorders`
+- Supports `/quota` command to show Trace.moe quota/concurrency details
+- Uses a light in-memory queue + retry for temporary Trace.moe limits (`402/429/503`)
 - Replies with top 3 matches max:
   - anime title
   - episode
   - similarity percentage (2 decimals)
   - timestamp range (`mm:ss`)
-  - preview image URL
-  - preview video URL (if available)
+  - sends preview image directly in Telegram
+  - sends preview video directly in Telegram (if available)
 - Arabic user-facing messages and robust error handling
 
 ## Environment Variables
@@ -23,6 +25,7 @@ Telegram bot that receives an anime screenshot as a photo, sends it to Trace.moe
 Set these in Vercel (`Project Settings -> Environment Variables`):
 
 - `BOT_TOKEN` (required)
+- `TRACE_MOE_API_KEY` (optional)
 
 ## Local Run
 

@@ -1,13 +1,17 @@
 import { z } from "zod";
-import { fetchWithTimeout, logError, safeJson, trimForTelegram } from "../lib/utils.js";
+import { fetchWithTimeout, logError, safeJson, sleep, trimForTelegram } from "../lib/utils.js";
 import { downloadFileBuffer, getFile, sendMessage, sendPhoto, sendVideo } from "../lib/telegram.js";
 
-const TRACE_SEARCH_URL = "https://api.trace.moe/search?anilistInfo";
+const TRACE_SEARCH_URL = "https://api.trace.moe/search?anilistInfo&cutBorders";
+const TRACE_ME_URL = "https://api.trace.moe/me";
 const MAX_RESULTS = 3;
 const MAX_IMAGE_SIZE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_SIZE_MB = Math.floor(MAX_IMAGE_SIZE_BYTES / (1024 * 1024));
 const TELEGRAM_DOWNLOAD_TIMEOUT_MS = 15_000;
 const TRACE_TIMEOUT_MS = 15_000;
+const TRACE_SEARCH_RETRIES = 2;
+const TRACE_RETRY_BASE_DELAY_MS = 700;
+const TRACE_RETRYABLE_STATUSES = new Set([402, 429, 503]);
 
 const IMAGE_GUIDELINES_TEXT = [
   "مهم قبل الإرسال:",
@@ -26,6 +30,10 @@ const TRACE_API_ERROR_MESSAGE =
   "تعذر الوصول إلى خدمة التعرف على الأنمي حاليًا. حاول مرة أخرى لاحقًا.";
 const TRACE_RESPONSE_ERROR_MESSAGE =
   "وصلت استجابة غير متوقعة من خدمة التعرف على الأنمي. جرّب صورة أوضح.";
+const TRACE_LIMIT_MESSAGE =
+  "الخدمة مزدحمة الآن أو تم تجاوز الحد المؤقت للطلبات. حاول بعد قليل.";
+const TRACE_ME_ERROR_MESSAGE =
+  "تعذر جلب حالة الحصة الآن. حاول مرة أخرى بعد قليل.";
 const TIMEOUT_ERROR_MESSAGE =
   "انتهت مهلة المعالجة. جرّب مرة أخرى بصورة أصغر أو أوضح.";
 const NO_RESULTS_MESSAGE =
@@ -33,6 +41,9 @@ const NO_RESULTS_MESSAGE =
 const PREVIEW_SEND_FAILED_MESSAGE = "تعذر إرسال المعاينة المرئية لهذه النتيجة.";
 const GENERIC_ERROR_MESSAGE = "حدث خطأ غير متوقع أثناء تحليل الصورة. حاول لاحقًا.";
 const SUCCESS_HEADER = "نتائج البحث عن الأنمي 🔍";
+const QUOTA_HEADER = "معلومات الحصة (Trace.moe)";
+
+let traceSearchQueue = Promise.resolve();
 
 const TelegramPhotoSchema = z
   .object({
@@ -74,6 +85,57 @@ class ProcessingError extends Error {
 
 function getIncomingMessage(update) {
   return update.message || update.edited_message || update.channel_post || null;
+}
+
+function isQuotaCommand(text) {
+  if (typeof text !== "string") {
+    return false;
+  }
+
+  const normalized = text.trim();
+  return /^\/quota(?:@[a-z0-9_]+)?$/i.test(normalized);
+}
+
+function buildTraceHeaders(apiKey) {
+  if (!apiKey) {
+    return undefined;
+  }
+
+  return {
+    "x-trace-key": apiKey,
+  };
+}
+
+function toSafeNumber(value) {
+  return Number.isFinite(value) ? Number(value) : null;
+}
+
+function formatQuotaMessage(info) {
+  const quota = toSafeNumber(info?.quota);
+  const quotaUsed = toSafeNumber(info?.quotaUsed);
+  const concurrency = toSafeNumber(info?.concurrency);
+  const priority = toSafeNumber(info?.priority);
+  const remaining =
+    quota !== null && quotaUsed !== null ? Math.max(quota - quotaUsed, 0) : null;
+  const id = typeof info?.id === "string" && info.id.trim() ? info.id.trim() : "غير متوفر";
+
+  const lines = [
+    QUOTA_HEADER,
+    `المعرّف: ${id}`,
+    `الحصة اليومية: ${quota ?? "غير متوفر"}`,
+    `المستخدم خلال آخر 24 ساعة: ${quotaUsed ?? "غير متوفر"}`,
+    `المتبقي: ${remaining ?? "غير متوفر"}`,
+    `التوازي (Concurrency): ${concurrency ?? "غير متوفر"}`,
+    `الأولوية: ${priority ?? "غير متوفر"}`,
+  ];
+
+  return lines.join("\n");
+}
+
+function enqueueTraceSearch(task) {
+  const queuedTask = traceSearchQueue.then(() => task());
+  traceSearchQueue = queuedTask.catch(() => {});
+  return queuedTask;
 }
 
 function isTimeoutError(error) {
@@ -278,8 +340,18 @@ async function sendErrorByType(token, chatId, error) {
       return;
     }
 
+    if (error.code === "TRACE_LIMIT_REACHED") {
+      await safeReply(token, chatId, TRACE_LIMIT_MESSAGE);
+      return;
+    }
+
     if (error.code === "TRACE_INVALID_RESPONSE") {
       await safeReply(token, chatId, TRACE_RESPONSE_ERROR_MESSAGE);
+      return;
+    }
+
+    if (error.code === "TRACE_ME_FAILURE") {
+      await safeReply(token, chatId, TRACE_ME_ERROR_MESSAGE);
       return;
     }
 
@@ -342,38 +414,101 @@ async function downloadTelegramPhoto(token, photo) {
   return buffer;
 }
 
-async function searchTraceMoe(imageBuffer) {
-  const form = new FormData();
-  form.append("image", new Blob([imageBuffer], { type: "image/jpeg" }), "screenshot.jpg");
-
+async function fetchTraceQuotaInfo(apiKey) {
   let response;
   try {
-    response = await fetchWithTimeout(TRACE_SEARCH_URL, {
-      method: "POST",
-      body: form,
+    response = await fetchWithTimeout(TRACE_ME_URL, {
+      method: "GET",
+      headers: buildTraceHeaders(apiKey),
       timeoutMs: TRACE_TIMEOUT_MS,
     });
   } catch (error) {
     if (isTimeoutError(error)) {
-      throw new ProcessingError("TIMEOUT", "Trace.moe request timeout", error);
+      throw new ProcessingError("TIMEOUT", "Trace.moe /me timeout", error);
     }
 
-    throw new ProcessingError("TRACE_API_FAILURE", "Trace.moe request failed", error);
+    throw new ProcessingError("TRACE_ME_FAILURE", "Trace.moe /me request failed", error);
   }
 
   if (!response.ok) {
     throw new ProcessingError(
-      "TRACE_API_FAILURE",
-      `Trace.moe returned non-OK status: ${response.status}`,
+      "TRACE_ME_FAILURE",
+      `Trace.moe /me returned non-OK status: ${response.status}`,
     );
   }
 
   const payload = await safeJson(response);
-  if (!payload || !Array.isArray(payload.result)) {
-    throw new ProcessingError("TRACE_INVALID_RESPONSE", "Trace.moe payload format was invalid");
+  if (!payload || typeof payload !== "object") {
+    throw new ProcessingError("TRACE_ME_FAILURE", "Trace.moe /me payload format was invalid");
   }
 
-  return payload.result.filter((item) => item && typeof item === "object");
+  return payload;
+}
+
+async function searchTraceMoe(imageBuffer, { apiKey } = {}) {
+  for (let attempt = 0; attempt <= TRACE_SEARCH_RETRIES; attempt += 1) {
+    const form = new FormData();
+    form.append("image", new Blob([imageBuffer], { type: "image/jpeg" }), "screenshot.jpg");
+
+    let response;
+    try {
+      response = await fetchWithTimeout(TRACE_SEARCH_URL, {
+        method: "POST",
+        body: form,
+        headers: buildTraceHeaders(apiKey),
+        timeoutMs: TRACE_TIMEOUT_MS,
+      });
+    } catch (error) {
+      const canRetry = attempt < TRACE_SEARCH_RETRIES;
+
+      if (isTimeoutError(error)) {
+        if (canRetry) {
+          await sleep(TRACE_RETRY_BASE_DELAY_MS * (attempt + 1));
+          continue;
+        }
+
+        throw new ProcessingError("TIMEOUT", "Trace.moe request timeout", error);
+      }
+
+      if (canRetry) {
+        await sleep(TRACE_RETRY_BASE_DELAY_MS * (attempt + 1));
+        continue;
+      }
+
+      throw new ProcessingError("TRACE_API_FAILURE", "Trace.moe request failed", error);
+    }
+
+    const payload = await safeJson(response);
+    if (!response.ok) {
+      const canRetry =
+        TRACE_RETRYABLE_STATUSES.has(response.status) && attempt < TRACE_SEARCH_RETRIES;
+
+      if (canRetry) {
+        await sleep(TRACE_RETRY_BASE_DELAY_MS * (attempt + 1));
+        continue;
+      }
+
+      if (TRACE_RETRYABLE_STATUSES.has(response.status)) {
+        throw new ProcessingError(
+          "TRACE_LIMIT_REACHED",
+          payload?.error || `Trace.moe retryable limit status ${response.status}`,
+        );
+      }
+
+      throw new ProcessingError(
+        "TRACE_API_FAILURE",
+        payload?.error || `Trace.moe returned non-OK status: ${response.status}`,
+      );
+    }
+
+    if (!payload || !Array.isArray(payload.result)) {
+      throw new ProcessingError("TRACE_INVALID_RESPONSE", "Trace.moe payload format was invalid");
+    }
+
+    return payload.result.filter((item) => item && typeof item === "object");
+  }
+
+  throw new ProcessingError("TRACE_LIMIT_REACHED", "Trace.moe search retries exhausted");
 }
 
 export default async function handler(req, res) {
@@ -388,6 +523,7 @@ export default async function handler(req, res) {
     res.status(500).json({ ok: false });
     return;
   }
+  const traceApiKey = process.env.TRACE_MOE_API_KEY?.trim() || "";
 
   let chatId = null;
 
@@ -407,8 +543,16 @@ export default async function handler(req, res) {
 
     const message = getIncomingMessage(parsed.data);
     chatId = message?.chat?.id ?? null;
+    const text = message?.text?.trim() || "";
 
     if (!message || chatId === null) {
+      res.status(200).json({ ok: true });
+      return;
+    }
+
+    if (isQuotaCommand(text)) {
+      const info = await fetchTraceQuotaInfo(traceApiKey);
+      await safeReply(token, chatId, formatQuotaMessage(info));
       res.status(200).json({ ok: true });
       return;
     }
@@ -421,7 +565,9 @@ export default async function handler(req, res) {
     }
 
     const imageBuffer = await downloadTelegramPhoto(token, photo);
-    const results = await searchTraceMoe(imageBuffer);
+    const results = await enqueueTraceSearch(() =>
+      searchTraceMoe(imageBuffer, { apiKey: traceApiKey }),
+    );
 
     if (results.length === 0) {
       await safeReply(token, chatId, NO_RESULTS_MESSAGE);
