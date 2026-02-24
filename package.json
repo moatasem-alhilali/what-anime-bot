@@ -1,5 +1,5 @@
 {
-  "name": "linkedin-telegram-bot",
+  "name": "what-anime-telegram-bot",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -11,9 +11,6 @@
     "start": "vercel dev"
   },
   "dependencies": {
-    "archiver": "^5.3.2",
-    "cheerio": "^1.0.0",
-    "p-limit": "^5.0.0",
     "zod": "^3.23.8"
   }
 }

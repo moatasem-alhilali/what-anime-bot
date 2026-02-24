@@ -331,9 +331,9 @@ export default async function handler(req, res) {
     return;
   }
 
-  const token = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+  const token = process.env.BOT_TOKEN;
   if (!token) {
-    logError("Missing BOT_TOKEN/TELEGRAM_BOT_TOKEN", new Error("Missing env variable"));
+    logError("Missing BOT_TOKEN", new Error("Missing env variable"));
     res.status(500).json({ ok: false });
     return;
   }
