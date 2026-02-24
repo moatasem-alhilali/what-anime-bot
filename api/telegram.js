@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { fetchWithTimeout, logError, safeJson, trimForTelegram } from "../lib/utils.js";
-import { downloadFileBuffer, getFile, sendMessage } from "../lib/telegram.js";
+import { downloadFileBuffer, getFile, sendMessage, sendPhoto, sendVideo } from "../lib/telegram.js";
 
 const TRACE_SEARCH_URL = "https://api.trace.moe/search?anilistInfo";
 const MAX_RESULTS = 3;
@@ -21,6 +21,7 @@ const TIMEOUT_ERROR_MESSAGE =
   "انتهت مهلة المعالجة. جرّب مرة أخرى بصورة أصغر أو أوضح.";
 const NO_RESULTS_MESSAGE =
   "لم يتم العثور على نتائج مناسبة. جرّب لقطة أوضح من نفس المشهد.";
+const PREVIEW_SEND_FAILED_MESSAGE = "تعذر إرسال المعاينة المرئية لهذه النتيجة.";
 const GENERIC_ERROR_MESSAGE = "حدث خطأ غير متوقع أثناء تحليل الصورة. حاول لاحقًا.";
 const SUCCESS_HEADER = "نتائج البحث عن الأنمي 🔍";
 
@@ -145,36 +146,77 @@ function formatSimilarity(similarity) {
   return `${(similarity * 100).toFixed(2)}%`;
 }
 
-function formatTraceResult(result, index) {
+function normalizePreviewUrl(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  if (!/^https?:\/\//i.test(normalized)) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function formatTraceResultDetails(result, index) {
   const title = pickAnimeTitle(result) || "غير متوفر";
   const from = formatTimestamp(result?.from);
   const to = formatTimestamp(result?.to);
-  const previewImage = result?.image ? String(result.image) : "غير متوفر";
-  const previewVideo = result?.video ? String(result.video) : null;
   const lines = [
-    `${index}. العنوان: ${title}`,
+    `النتيجة ${index}`,
+    `العنوان: ${title}`,
     `الحلقة: ${formatEpisode(result?.episode)}`,
     `نسبة التشابه: ${formatSimilarity(result?.similarity)}`,
     `الوقت: ${from} → ${to}`,
-    `رابط صورة المعاينة: ${previewImage}`,
   ];
-
-  if (previewVideo) {
-    lines.push(`رابط فيديو المعاينة: ${previewVideo}`);
-  }
 
   return lines.join("\n");
 }
 
-function formatTraceResultsMessage(results) {
-  const sections = results.slice(0, MAX_RESULTS).map((item, index) => {
-    return formatTraceResult(item, index + 1);
-  });
+async function sendResultPreview(token, chatId, result, index) {
+  const details = formatTraceResultDetails(result, index);
+  const imageUrl = normalizePreviewUrl(result?.image);
+  const videoUrl = normalizePreviewUrl(result?.video);
+  let sent = false;
 
-  return trimForTelegram(
-    `${SUCCESS_HEADER}\n\n${sections.join("\n\n--------------------\n\n")}`,
-    3900,
-  );
+  if (imageUrl) {
+    try {
+      await sendPhoto(token, {
+        chatId,
+        photoUrl: imageUrl,
+        caption: details,
+      });
+      sent = true;
+    } catch (error) {
+      logError("Failed to send preview image", error, { chatId, index, imageUrl });
+    }
+  }
+
+  if (videoUrl) {
+    try {
+      await sendVideo(token, {
+        chatId,
+        videoUrl,
+        caption: sent ? "" : details,
+      });
+      sent = true;
+    } catch (error) {
+      logError("Failed to send preview video", error, { chatId, index, videoUrl });
+    }
+  }
+
+  if (!sent) {
+    await safeReply(
+      token,
+      chatId,
+      trimForTelegram(`${details}\n${PREVIEW_SEND_FAILED_MESSAGE}`, 3900),
+    );
+  }
 }
 
 async function parseBody(req) {
@@ -378,7 +420,13 @@ export default async function handler(req, res) {
       return;
     }
 
-    await safeReply(token, chatId, formatTraceResultsMessage(results));
+    const topResults = results.slice(0, MAX_RESULTS);
+    await safeReply(token, chatId, `${SUCCESS_HEADER}\nعدد النتائج: ${topResults.length}`);
+
+    for (let index = 0; index < topResults.length; index += 1) {
+      await sendResultPreview(token, chatId, topResults[index], index + 1);
+    }
+
     res.status(200).json({ ok: true });
   } catch (error) {
     logError("Failed to process Telegram update", error, { chatId, code: error?.code });
