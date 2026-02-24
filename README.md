@@ -4,6 +4,7 @@
 [![Vercel](https://img.shields.io/badge/Deploy-Vercel-000000?logo=vercel&logoColor=white)](https://vercel.com/)
 
 Production-ready Telegram bot that accepts a LinkedIn post URL and replies in Arabic with:
+
 - extracted post text
 - post media (images/videos)
 - post documents (PDF when available)
@@ -24,7 +25,8 @@ Live deployment: `https://linkedin-scraper-orcin.vercel.app`
 - Media handling:
   - single media item => `sendPhoto` / `sendVideo`
   - 2-10 items => `sendMediaGroup`
-  - >10 items => ZIP in memory and send as document
+  - > 10 items => ZIP in memory and send as document
+    >
   - PDF/doc attachments sent as documents
 - Concurrency control with `p-limit` (max 3 downloads)
 - Input validation with `zod`
@@ -74,22 +76,26 @@ Set these in Vercel (`Project Settings -> Environment Variables`):
 ## Quick Start
 
 1. Clone:
+
 ```bash
 git clone https://github.com/moatasem-alhilali/linkedin-scraper-nodejs.git
 cd linkedin-scraper-nodejs
 ```
 
 2. Install dependencies:
+
 ```bash
 npm install
 ```
 
 3. Run locally:
+
 ```bash
 npm run dev
 ```
 
 4. Local webhook test:
+
 ```bash
 curl -X POST "http://localhost:3000/api/telegram" \
   -H "Content-Type: application/json" \
@@ -108,6 +114,7 @@ curl -X POST "http://localhost:3000/api/telegram" \
 2. Import the repo in Vercel.
 3. Add `TELEGRAM_BOT_TOKEN` in Production environment variables.
 4. Deploy:
+
 ```bash
 npx vercel --prod
 ```
@@ -127,6 +134,7 @@ curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"
 ```
 
 Expected:
+
 - `result.url` points to `https://YOUR_DOMAIN/api/telegram`
 - no recent `last_error_message`
 
@@ -163,10 +171,12 @@ Endpoint: `POST /api/telegram`
 ## Testing Guide (Postman)
 
 Request:
+
 - Method: `POST`
 - URL: `https://YOUR_DOMAIN/api/telegram`
 - Header: `Content-Type: application/json`
 - Body:
+
 ```json
 {
   "update_id": 100001,
@@ -178,6 +188,7 @@ Request:
 ```
 
 Scenarios to test:
+
 - valid public image post
 - valid public video post
 - valid public post containing PDF/document
@@ -186,13 +197,13 @@ Scenarios to test:
 
 ## Production Checklist
 
-- [x] Node.js 18+ and ESM
-- [x] Serverless-ready (`/api/telegram.js`)
-- [x] Timeout + retry strategy
-- [x] Strict URL and hostname validation
-- [x] Concurrency control for media downloads
-- [x] In-memory ZIP generation
-- [x] Arabic responses + structured error logs
+- [X] Node.js 18+ and ESM
+- [X] Serverless-ready (`/api/telegram.js`)
+- [X] Timeout + retry strategy
+- [X] Strict URL and hostname validation
+- [X] Concurrency control for media downloads
+- [X] In-memory ZIP generation
+- [X] Arabic responses + structured error logs
 
 ## LinkedIn Scraping Limitations
 
@@ -207,6 +218,7 @@ Scenarios to test:
 Issues and pull requests are welcome.
 
 Recommended contribution flow:
+
 1. Fork the repository
 2. Create a feature branch
 3. Add/adjust tests or reproducible validation steps
@@ -214,5 +226,5 @@ Recommended contribution flow:
 
 ## License
 
-No license file is included yet.  
+No license file is included yet.
 If you want public reuse, add a license file (for example `MIT`) to the repository root.

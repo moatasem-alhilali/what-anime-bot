@@ -1,39 +1,48 @@
 import { z } from "zod";
-import {
-  extractFirstUrl,
-  isValidLinkedInPostUrl,
-  logError,
-  trimForTelegram,
-} from "../lib/utils.js";
-import {
-  LinkedInExtractionError,
-  downloadLinkedInMedia,
-  scrapeLinkedInPost,
-} from "../lib/linkedin.js";
-import {
-  sendDocument,
-  sendMediaGroup,
-  sendMessage,
-  sendPhoto,
-  sendVideo,
-} from "../lib/telegram.js";
-import { createZipBuffer } from "../lib/zip.js";
+import { fetchWithTimeout, logError, safeJson, trimForTelegram } from "../lib/utils.js";
+import { downloadFileBuffer, getFile, sendMessage } from "../lib/telegram.js";
 
-const INVALID_URL_MESSAGE =
-  "الرابط غير صالح. الرجاء إرسال رابط منشور من لينكدإن.";
-const NO_CONTENT_MESSAGE =
-  "لم أستطع استخراج محتوى المنشور. قد يكون خاصًا أو محميًا.";
-const PRIVATE_POST_MESSAGE = "قد يكون المنشور خاصًا أو يتطلب تسجيل دخول.";
-const GENERIC_ERROR_MESSAGE =
-  "حدث خطأ أثناء معالجة الرابط. حاول مرة أخرى لاحقًا.";
-const SUCCESS_HEADER = "تم استخراج المنشور بنجاح ✅";
+const TRACE_SEARCH_URL = "https://api.trace.moe/search?anilistInfo";
+const MAX_RESULTS = 3;
+const MAX_IMAGE_SIZE_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGE_SIZE_MB = Math.floor(MAX_IMAGE_SIZE_BYTES / (1024 * 1024));
+const TELEGRAM_DOWNLOAD_TIMEOUT_MS = 15_000;
+const TRACE_TIMEOUT_MS = 15_000;
 
-const TelegramMessageSchema = z.object({
-  chat: z.object({
-    id: z.union([z.number(), z.string()]),
-  }),
-  text: z.string().optional(),
-});
+const NO_IMAGE_MESSAGE = "يرجى إرسال لقطة شاشة كصورة لمعرفة اسم الأنمي.";
+const IMAGE_TOO_LARGE_MESSAGE = `الصورة كبيرة جدًا. الحد الأقصى المسموح هو ${MAX_IMAGE_SIZE_MB} ميجابايت.`;
+const TELEGRAM_DOWNLOAD_ERROR_MESSAGE =
+  "تعذر تنزيل الصورة من تيليجرام. أعد إرسال الصورة مرة أخرى.";
+const TRACE_API_ERROR_MESSAGE =
+  "تعذر الوصول إلى خدمة التعرف على الأنمي حاليًا. حاول مرة أخرى لاحقًا.";
+const TRACE_RESPONSE_ERROR_MESSAGE =
+  "وصلت استجابة غير متوقعة من خدمة التعرف على الأنمي. جرّب صورة أوضح.";
+const TIMEOUT_ERROR_MESSAGE =
+  "انتهت مهلة المعالجة. جرّب مرة أخرى بصورة أصغر أو أوضح.";
+const NO_RESULTS_MESSAGE =
+  "لم يتم العثور على نتائج مناسبة. جرّب لقطة أوضح من نفس المشهد.";
+const GENERIC_ERROR_MESSAGE = "حدث خطأ غير متوقع أثناء تحليل الصورة. حاول لاحقًا.";
+const SUCCESS_HEADER = "نتائج البحث عن الأنمي 🔍";
+
+const TelegramPhotoSchema = z
+  .object({
+    file_id: z.string().min(1),
+    file_size: z.number().int().nonnegative().optional(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+  })
+  .passthrough();
+
+const TelegramMessageSchema = z
+  .object({
+    chat: z.object({
+      id: z.union([z.number(), z.string()]),
+    }),
+    text: z.string().optional(),
+    caption: z.string().optional(),
+    photo: z.array(TelegramPhotoSchema).optional(),
+  })
+  .passthrough();
 
 const TelegramUpdateSchema = z
   .object({
@@ -44,8 +53,128 @@ const TelegramUpdateSchema = z
   })
   .passthrough();
 
+class ProcessingError extends Error {
+  constructor(code, message, cause) {
+    super(message);
+    this.name = "ProcessingError";
+    this.code = code;
+    this.cause = cause;
+  }
+}
+
 function getIncomingMessage(update) {
   return update.message || update.edited_message || update.channel_post || null;
+}
+
+function isTimeoutError(error) {
+  if (error?.name === "AbortError") {
+    return true;
+  }
+
+  const message = String(error?.message || "").toLowerCase();
+  return message.includes("timeout");
+}
+
+function getPhotoSortWeight(photo) {
+  if (typeof photo?.file_size === "number" && Number.isFinite(photo.file_size)) {
+    return photo.file_size;
+  }
+
+  const width = Number.isFinite(photo?.width) ? photo.width : 0;
+  const height = Number.isFinite(photo?.height) ? photo.height : 0;
+  return width * height;
+}
+
+function getLargestPhoto(photos) {
+  if (!Array.isArray(photos) || photos.length === 0) {
+    return null;
+  }
+
+  return photos.reduce((largest, candidate) => {
+    if (!largest) {
+      return candidate;
+    }
+
+    return getPhotoSortWeight(candidate) >= getPhotoSortWeight(largest)
+      ? candidate
+      : largest;
+  }, null);
+}
+
+function formatTimestamp(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) {
+    return "--:--";
+  }
+
+  const totalSeconds = Math.floor(seconds);
+  const minutes = Math.floor(totalSeconds / 60);
+  const remaining = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+}
+
+function pickAnimeTitle(result) {
+  const title = result?.anilist?.title;
+  if (title && typeof title === "object") {
+    return title.romaji || title.english || title.native || null;
+  }
+
+  if (typeof result?.filename === "string" && result.filename.trim()) {
+    return result.filename.trim();
+  }
+
+  return null;
+}
+
+function formatEpisode(episode) {
+  if (typeof episode === "number" && Number.isFinite(episode)) {
+    return String(episode);
+  }
+
+  if (typeof episode === "string" && episode.trim()) {
+    return episode.trim();
+  }
+
+  return "غير متوفر";
+}
+
+function formatSimilarity(similarity) {
+  if (typeof similarity !== "number" || !Number.isFinite(similarity)) {
+    return "غير متوفر";
+  }
+
+  return `${(similarity * 100).toFixed(2)}%`;
+}
+
+function formatTraceResult(result, index) {
+  const title = pickAnimeTitle(result) || "غير متوفر";
+  const from = formatTimestamp(result?.from);
+  const to = formatTimestamp(result?.to);
+  const previewImage = result?.image ? String(result.image) : "غير متوفر";
+  const previewVideo = result?.video ? String(result.video) : null;
+  const lines = [
+    `${index}. العنوان: ${title}`,
+    `الحلقة: ${formatEpisode(result?.episode)}`,
+    `نسبة التشابه: ${formatSimilarity(result?.similarity)}`,
+    `الوقت: ${from} → ${to}`,
+    `رابط صورة المعاينة: ${previewImage}`,
+  ];
+
+  if (previewVideo) {
+    lines.push(`رابط فيديو المعاينة: ${previewVideo}`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatTraceResultsMessage(results) {
+  const sections = results.slice(0, MAX_RESULTS).map((item, index) => {
+    return formatTraceResult(item, index + 1);
+  });
+
+  return trimForTelegram(
+    `${SUCCESS_HEADER}\n\n${sections.join("\n\n--------------------\n\n")}`,
+    3900,
+  );
 }
 
 async function parseBody(req) {
@@ -82,24 +211,118 @@ async function safeReply(token, chatId, text) {
 }
 
 async function sendErrorByType(token, chatId, error) {
-  if (error instanceof LinkedInExtractionError) {
-    if (error.code === "INVALID_URL") {
-      await safeReply(token, chatId, INVALID_URL_MESSAGE);
+  if (error instanceof ProcessingError) {
+    if (error.code === "IMAGE_TOO_LARGE") {
+      await safeReply(token, chatId, IMAGE_TOO_LARGE_MESSAGE);
       return;
     }
 
-    if (error.code === "TEXT_NOT_FOUND") {
-      await safeReply(token, chatId, NO_CONTENT_MESSAGE);
+    if (error.code === "TELEGRAM_DOWNLOAD_FAILED") {
+      await safeReply(token, chatId, TELEGRAM_DOWNLOAD_ERROR_MESSAGE);
       return;
     }
 
-    if (error.code === "PRIVATE_OR_PROTECTED") {
-      await safeReply(token, chatId, PRIVATE_POST_MESSAGE);
+    if (error.code === "TRACE_API_FAILURE") {
+      await safeReply(token, chatId, TRACE_API_ERROR_MESSAGE);
+      return;
+    }
+
+    if (error.code === "TRACE_INVALID_RESPONSE") {
+      await safeReply(token, chatId, TRACE_RESPONSE_ERROR_MESSAGE);
+      return;
+    }
+
+    if (error.code === "TIMEOUT") {
+      await safeReply(token, chatId, TIMEOUT_ERROR_MESSAGE);
       return;
     }
   }
 
+  if (isTimeoutError(error)) {
+    await safeReply(token, chatId, TIMEOUT_ERROR_MESSAGE);
+    return;
+  }
+
   await safeReply(token, chatId, GENERIC_ERROR_MESSAGE);
+}
+
+async function downloadTelegramPhoto(token, photo) {
+  if (photo.file_size && photo.file_size > MAX_IMAGE_SIZE_BYTES) {
+    throw new ProcessingError("IMAGE_TOO_LARGE", "Photo exceeded size limit");
+  }
+
+  let fileMeta;
+  try {
+    fileMeta = await getFile(token, { fileId: photo.file_id });
+  } catch (error) {
+    if (isTimeoutError(error)) {
+      throw new ProcessingError("TIMEOUT", "Telegram getFile timeout", error);
+    }
+
+    throw new ProcessingError("TELEGRAM_DOWNLOAD_FAILED", "Telegram getFile failed", error);
+  }
+
+  if (!fileMeta?.file_path) {
+    throw new ProcessingError("TELEGRAM_DOWNLOAD_FAILED", "Telegram file path was not returned");
+  }
+
+  let buffer;
+  try {
+    buffer = await downloadFileBuffer(token, {
+      filePath: fileMeta.file_path,
+      timeoutMs: TELEGRAM_DOWNLOAD_TIMEOUT_MS,
+    });
+  } catch (error) {
+    if (isTimeoutError(error)) {
+      throw new ProcessingError("TIMEOUT", "Telegram file download timeout", error);
+    }
+
+    throw new ProcessingError("TELEGRAM_DOWNLOAD_FAILED", "Telegram file download failed", error);
+  }
+
+  if (!buffer || buffer.length === 0) {
+    throw new ProcessingError("TELEGRAM_DOWNLOAD_FAILED", "Downloaded image is empty");
+  }
+
+  if (buffer.length > MAX_IMAGE_SIZE_BYTES) {
+    throw new ProcessingError("IMAGE_TOO_LARGE", "Downloaded image exceeded size limit");
+  }
+
+  return buffer;
+}
+
+async function searchTraceMoe(imageBuffer) {
+  const form = new FormData();
+  form.append("image", new Blob([imageBuffer], { type: "image/jpeg" }), "screenshot.jpg");
+
+  let response;
+  try {
+    response = await fetchWithTimeout(TRACE_SEARCH_URL, {
+      method: "POST",
+      body: form,
+      timeoutMs: TRACE_TIMEOUT_MS,
+    });
+  } catch (error) {
+    if (isTimeoutError(error)) {
+      throw new ProcessingError("TIMEOUT", "Trace.moe request timeout", error);
+    }
+
+    throw new ProcessingError("TRACE_API_FAILURE", "Trace.moe request failed", error);
+  }
+
+  if (!response.ok) {
+    throw new ProcessingError(
+      "TRACE_API_FAILURE",
+      `Trace.moe returned non-OK status: ${response.status}`,
+    );
+  }
+
+  const payload = await safeJson(response);
+  if (!payload || !Array.isArray(payload.result)) {
+    throw new ProcessingError("TRACE_INVALID_RESPONSE", "Trace.moe payload format was invalid");
+  }
+
+  return payload.result.filter((item) => item && typeof item === "object");
 }
 
 export default async function handler(req, res) {
@@ -108,9 +331,9 @@ export default async function handler(req, res) {
     return;
   }
 
-  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const token = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
-    logError("Missing TELEGRAM_BOT_TOKEN", new Error("Missing env variable"));
+    logError("Missing BOT_TOKEN/TELEGRAM_BOT_TOKEN", new Error("Missing env variable"));
     res.status(500).json({ ok: false });
     return;
   }
@@ -132,97 +355,33 @@ export default async function handler(req, res) {
     }
 
     const message = getIncomingMessage(parsed.data);
-    const text = message?.text?.trim();
     chatId = message?.chat?.id ?? null;
 
-    if (!text || chatId === null) {
+    if (!message || chatId === null) {
       res.status(200).json({ ok: true });
       return;
     }
 
-    const maybeUrl = extractFirstUrl(text);
-    if (!maybeUrl || !isValidLinkedInPostUrl(maybeUrl)) {
-      await safeReply(token, chatId, INVALID_URL_MESSAGE);
+    const photo = getLargestPhoto(message.photo);
+    if (!photo) {
+      await safeReply(token, chatId, NO_IMAGE_MESSAGE);
       res.status(200).json({ ok: true });
       return;
     }
 
-    const post = await scrapeLinkedInPost(maybeUrl);
-    const safeText = trimForTelegram(post.text, 3600);
-    await sendMessage(token, {
-      chatId,
-      text: `${SUCCESS_HEADER}\n\n${safeText}`,
-    });
+    const imageBuffer = await downloadTelegramPhoto(token, photo);
+    const results = await searchTraceMoe(imageBuffer);
 
-    const mediaTargets = [
-      ...post.imageUrls.map((url) => ({ url, type: "image" })),
-      ...post.videoUrls.map((url) => ({ url, type: "video" })),
-      ...post.documentUrls.map((url) => ({ url, type: "document" })),
-    ];
-
-    if (mediaTargets.length === 0) {
+    if (results.length === 0) {
+      await safeReply(token, chatId, NO_RESULTS_MESSAGE);
       res.status(200).json({ ok: true });
       return;
     }
 
-    const downloadedMedia = await downloadLinkedInMedia(mediaTargets, {
-      referer: post.preferredReferer,
-    });
-    if (downloadedMedia.length === 0) {
-      res.status(200).json({ ok: true });
-      return;
-    }
-
-    const streamableMedia = downloadedMedia.filter(
-      (item) => item.mediaType === "image" || item.mediaType === "video",
-    );
-    const documentMedia = downloadedMedia.filter(
-      (item) => item.mediaType === "document",
-    );
-
-    if (streamableMedia.length === 1) {
-      const singleFile = streamableMedia[0];
-      if (singleFile.mediaType === "video") {
-        await sendVideo(token, {
-          chatId,
-          buffer: singleFile.buffer,
-          filename: singleFile.filename || "linkedin-video.mp4",
-          mimeType: singleFile.mimeType || "video/mp4",
-        });
-      } else {
-        await sendPhoto(token, {
-          chatId,
-          buffer: singleFile.buffer,
-          filename: singleFile.filename || "linkedin-image.jpg",
-          mimeType: singleFile.mimeType || "image/jpeg",
-        });
-      }
-    } else if (streamableMedia.length > 1 && streamableMedia.length <= 10) {
-      await sendMediaGroup(token, { chatId, mediaFiles: streamableMedia });
-    } else if (streamableMedia.length > 10) {
-      const zipBuffer = await createZipBuffer(streamableMedia);
-      await sendDocument(token, {
-        chatId,
-        buffer: zipBuffer,
-        filename: "linkedin-media.zip",
-        mimeType: "application/zip",
-        caption: "تم تجميع صور/فيديوهات المنشور في ملف ZIP.",
-      });
-    }
-
-    for (const file of documentMedia) {
-      await sendDocument(token, {
-        chatId,
-        buffer: file.buffer,
-        filename: file.filename || "linkedin-document.pdf",
-        mimeType: file.mimeType || "application/pdf",
-        caption: "تم استخراج ملف من المنشور.",
-      });
-    }
-
+    await safeReply(token, chatId, formatTraceResultsMessage(results));
     res.status(200).json({ ok: true });
   } catch (error) {
-    logError("Failed to process Telegram update", error, { chatId });
+    logError("Failed to process Telegram update", error, { chatId, code: error?.code });
 
     if (chatId !== null) {
       await sendErrorByType(token, chatId, error);
